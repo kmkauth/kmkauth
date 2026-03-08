@@ -231,10 +231,19 @@ The system prompt instructs the LLM to cite author names and years when referrin
 > Flat RAG: pypdf page splits, 512-char chunks, same embedding model, no metadata. Same LLM.
 >
 > **5.3 Metrics**
-> - *Answer relevance*: human evaluation or LLM-as-judge (1–5 scale) on 20–50 representative questions
+> We adopt the RAGAS evaluation framework (Es et al., 2023) and the LLM-as-judge methodology
+> (Zheng et al., 2023) to score system outputs automatically at scale. Each answer is scored on
+> four dimensions (0–5 each, 20 points total):
+> - *Faithfulness* (RAGAS): every claim is grounded in retrieved context — the primary hallucination metric
+> - *Answer relevance* (RAGAS): the answer addresses the question asked
+> - *Completeness*: all parts of the question are covered given what the context allows
+> - *Citation accuracy*: answers name specific authors and years rather than vague "the document" references
+>
+> Additional automated checks:
 > - *Source precision*: for questions with known ground-truth sources, what fraction of retrieved parents contain the answer?
-> - *Citation accuracy*: does the answer correctly attribute claims to the right author/year?
-> - *Retrieval latency*: wall-clock time per query
+> - *Filter compliance*: for metadata-filtered queries, all returned sources must satisfy the year/author constraint
+> - *Hallucination refusal rate*: for off-topic queries, the system must say it cannot answer rather than confabulate
+> - *Retrieval latency*: wall-clock time per query (seconds, end-to-end)
 >
 > **5.4 Suggested ablations**
 > - Full system vs. no GROBID (pypdf fallback)
@@ -306,6 +315,8 @@ The full implementation runs locally, requires no cloud services for storage or 
 - Reimers, N., & Gurevych, I. (2019). *Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks.* EMNLP 2019.
 - Trung, L. (2023). *LangChain Parent Document Retriever.* LangChain documentation.
 - Johnson, J., Douze, M., & Jégou, H. (2019). *Billion-scale similarity search with GPUs.* IEEE Transactions on Big Data.
+- Es, S., James, J., Espinosa-Anke, L., & Schockaert, S. (2023). *RAGAS: Automated Evaluation of Retrieval Augmented Generation.* arXiv:2309.15217.
+- Zheng, L., et al. (2023). *Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena.* NeurIPS 2023.
 
 ---
 
