@@ -1,104 +1,176 @@
 """
-vectorstore.py — Embed text chunks and store/retrieve them with ChromaDB.
+vectorstore.py — Two-collection ChromaDB store for hierarchical RAG.
 
-Uses sentence-transformers for local embeddings (no API key needed for this part).
+Collections:
+  "parents"  — large chunks stored by ID, NOT searched by vector.
+               We look these up by ID after finding relevant children.
+
+  "children" — small chunks WITH vector embeddings.
+               These are what we actually search against the query.
+
+Retrieval flow:
+  1. Embed the user's query
+  2. Search "children" collection → get top-K child chunks
+  3. De-duplicate their parent_ids
+  4. Fetch matching parent chunks from "parents" by ID
+  5. Send parent text (rich context) to Claude
 """
 
-import hashlib
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-# Local embedding model — downloads once, then cached
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-DB_PATH = "rag/db"
-COLLECTION_NAME = "documents"
+EMBEDDING_MODEL    = "all-MiniLM-L6-v2"
+DB_PATH            = "rag/db"
+PARENTS_COLLECTION = "parents"
+CHILDREN_COLLECTION = "children"
 
 
-def _get_client() -> chromadb.ClientAPI:
+def _client() -> chromadb.ClientAPI:
     return chromadb.PersistentClient(
         path=DB_PATH,
         settings=Settings(anonymized_telemetry=False),
     )
 
 
-def _get_collection(client: chromadb.ClientAPI) -> chromadb.Collection:
+def _parents_col(client: chromadb.ClientAPI) -> chromadb.Collection:
+    # No embedding function — we store & retrieve by ID, not by vector
+    return client.get_or_create_collection(name=PARENTS_COLLECTION)
+
+
+def _children_col(client: chromadb.ClientAPI) -> chromadb.Collection:
     return client.get_or_create_collection(
-        name=COLLECTION_NAME,
+        name=CHILDREN_COLLECTION,
         metadata={"hnsw:space": "cosine"},
     )
 
 
-def _chunk_id(chunk: dict) -> str:
-    """Stable unique ID for a chunk based on its content."""
-    key = f"{chunk['source']}:p{chunk['page']}:s{chunk.get('chunk_start', 0)}"
-    return hashlib.md5(key.encode()).hexdigest()
+# ── Ingestion ─────────────────────────────────────────────────────────────────
 
-
-def add_chunks(chunks: list[dict]) -> None:
-    """
-    Embed chunks and upsert them into ChromaDB.
-    Skips chunks that are already stored (idempotent).
-    """
-    if not chunks:
-        print("No chunks to add.")
+def add_parents(parents: list[dict]) -> None:
+    """Store parent chunks by ID (no embeddings needed)."""
+    if not parents:
         return
+    client = _client()
+    col = _parents_col(client)
+    col.upsert(
+        ids=[p["id"] for p in parents],
+        documents=[p["text"] for p in parents],
+        metadatas=[{"source": p["source"], "page": str(p["page"])} for p in parents],
+    )
+    print(f"Stored {len(parents)} parent chunks.")
 
-    print(f"Embedding {len(chunks)} chunks with '{EMBEDDING_MODEL}'...")
+
+def add_children(children: list[dict]) -> None:
+    """Embed child chunks and store them with a reference to their parent."""
+    if not children:
+        return
+    print(f"Embedding {len(children)} child chunks with '{EMBEDDING_MODEL}'...")
     model = SentenceTransformer(EMBEDDING_MODEL)
-    texts = [c["text"] for c in chunks]
+    texts = [c["text"] for c in children]
     embeddings = model.encode(texts, show_progress_bar=True).tolist()
 
-    client = _get_client()
-    collection = _get_collection(client)
-
-    ids = [_chunk_id(c) for c in chunks]
-    metadatas = [{"source": c["source"], "page": str(c["page"])} for c in chunks]
-
-    collection.upsert(
-        ids=ids,
+    client = _client()
+    col = _children_col(client)
+    col.upsert(
+        ids=[c["id"] for c in children],
         documents=texts,
         embeddings=embeddings,
-        metadatas=metadatas,
+        metadatas=[
+            {
+                "source":    c["source"],
+                "page":      str(c["page"]),
+                "parent_id": c["parent_id"],
+            }
+            for c in children
+        ],
     )
-    print(f"Stored {len(chunks)} chunks in ChromaDB at '{DB_PATH}'.")
+    print(f"Stored {len(children)} child chunks.")
 
+
+# ── Retrieval ─────────────────────────────────────────────────────────────────
 
 def search(query: str, top_k: int = 5) -> list[dict]:
     """
-    Embed the query and return the top_k most relevant chunks.
+    Hierarchical retrieval:
+      1. Find the best child chunks for the query.
+      2. Fetch their parent chunks (rich context).
+      3. Return de-duplicated parents, ordered by best child match score.
 
-    Returns a list of dicts with keys: text, source, page, score.
+    Each returned dict has: text, source, page, score, matched_child (preview).
     """
     model = SentenceTransformer(EMBEDDING_MODEL)
     query_embedding = model.encode([query]).tolist()
 
-    client = _get_client()
-    collection = _get_collection(client)
+    client = _client()
+    children_col = _children_col(client)
 
-    results = collection.query(
+    # Fetch more children than top_k because multiple children can share a parent
+    raw = children_col.query(
         query_embeddings=query_embedding,
-        n_results=top_k,
+        n_results=min(top_k * 3, children_col.count() or 1),
         include=["documents", "metadatas", "distances"],
     )
 
-    hits = []
+    # Build ordered list of (parent_id, child_text, score)
+    seen_parents: dict[str, dict] = {}  # parent_id -> best hit so far
     for doc, meta, dist in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
+        raw["documents"][0],
+        raw["metadatas"][0],
+        raw["distances"][0],
     ):
-        hits.append({
-            "text": doc,
-            "source": meta.get("source", ""),
-            "page": meta.get("page", "?"),
-            "score": round(1 - dist, 4),  # cosine similarity
+        parent_id = meta["parent_id"]
+        score = round(1 - dist, 4)
+        if parent_id not in seen_parents or score > seen_parents[parent_id]["score"]:
+            seen_parents[parent_id] = {
+                "parent_id":     parent_id,
+                "matched_child": doc,
+                "score":         score,
+                "source":        meta.get("source", ""),
+                "page":          meta.get("page", "?"),
+            }
+
+    # Keep only the top_k unique parents, ordered by score
+    top_parents = sorted(seen_parents.values(), key=lambda x: x["score"], reverse=True)[:top_k]
+
+    # Fetch full parent texts by ID
+    parents_col = _parents_col(client)
+    parent_ids = [h["parent_id"] for h in top_parents]
+    fetched = parents_col.get(ids=parent_ids, include=["documents", "metadatas"])
+
+    id_to_doc = dict(zip(fetched["ids"], fetched["documents"]))
+    id_to_meta = dict(zip(fetched["ids"], fetched["metadatas"]))
+
+    results = []
+    for hit in top_parents:
+        pid = hit["parent_id"]
+        results.append({
+            "text":          id_to_doc.get(pid, "[parent not found]"),
+            "source":        id_to_meta.get(pid, {}).get("source", hit["source"]),
+            "page":          id_to_meta.get(pid, {}).get("page", hit["page"]),
+            "score":         hit["score"],
+            "matched_child": hit["matched_child"],  # the small chunk that triggered this
         })
-    return hits
+
+    return results
 
 
-def collection_size() -> int:
-    """Return how many chunks are currently stored."""
-    client = _get_client()
-    collection = _get_collection(client)
-    return collection.count()
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+def collection_sizes() -> dict[str, int]:
+    client = _client()
+    return {
+        "parents":  _parents_col(client).count(),
+        "children": _children_col(client).count(),
+    }
+
+
+def clear_all() -> None:
+    """Delete both collections (useful for re-ingesting from scratch)."""
+    client = _client()
+    for name in (PARENTS_COLLECTION, CHILDREN_COLLECTION):
+        try:
+            client.delete_collection(name)
+        except Exception:
+            pass
+    print("Cleared all collections.")
