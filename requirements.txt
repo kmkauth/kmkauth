@@ -3,3 +3,7 @@ chromadb>=0.5.0
 pypdf>=4.0.0
 requests>=2.31.0
 sentence-transformers>=3.0.0
+# adaptive control / PCA-RPCA demo
+numpy>=1.26.0
+pandas>=2.2.0
+matplotlib>=3.8.0
