@@ -16,12 +16,12 @@ Data matrix structure (suitable for RPCA decomposition)
     S : sparse    – abrupt faults on individual channels
     N : small i.i.d. Gaussian noise
 
-Sensor channels (10 total)
+Sensor channels (10 total)   – temperatures in Rankine (°R = K × 1.8)
     Nc     – corrected shaft speed          [%]
     PR     – compressor pressure ratio      [-]
-    T2     – compressor delivery temp       [K]
-    TIT    – turbine inlet temperature      [K]
-    EGT    – exhaust gas temperature        [K]
+    T2     – compressor delivery temp       [°R]
+    TIT    – turbine inlet temperature      [°R]
+    EGT    – exhaust gas temperature        [°R]
     Wf     – fuel flow                      [g/s  (normalised)]
     eta_c  – compressor isentropic eff.     [-]
     eta_t  – turbine isentropic eff.        [-]
@@ -88,13 +88,14 @@ def cycle(P_set: float, T_amb: float, eta_c: float, eta_t: float) -> dict:
     W_net        = W_turbine - W_compressor          # [kJ/kg_air]
     SFC          = Wf / max(W_net, 1e-6) * 1e6      # [mg/kJ]  (fuel per net work)
 
+    K2R = 1.8   # Kelvin → Rankine conversion factor
     return dict(
         Nc=Nc,
         PR=PR,
-        T2=T2,
-        TIT=TIT,
-        EGT=EGT,
-        Wf=Wf * 1e3,        # converted to g/s (×1000 for readability)
+        T2=T2   * K2R,      # compressor delivery temp  [°R]
+        TIT=TIT * K2R,      # turbine inlet temperature [°R]
+        EGT=EGT * K2R,      # exhaust gas temperature   [°R]
+        Wf=Wf * 1e3,        # fuel flow                 [g/s]
         eta_c=eta_c,
         eta_t=eta_t,
         W_net=W_net,
@@ -111,7 +112,7 @@ def generate_normal(n_per_condition: int = 120) -> list[dict]:
     Each condition has n_per_condition samples with small Gaussian noise.
     """
     power_settings = [0.60, 0.70, 0.80, 0.90, 1.00]
-    ambient_temps  = [273.15, 288.15, 303.15]   # ISA−15 / ISA / ISA+15  [K]
+    ambient_temps  = [273.15, 288.15, 303.15]   # ISA−15 / ISA / ISA+15  [K] (used internally)
     eta_c0, eta_t0 = 0.880, 0.900               # clean-engine efficiencies
 
     rows = []
@@ -122,7 +123,7 @@ def generate_normal(n_per_condition: int = 120) -> list[dict]:
                 et  = eta_t0 + RNG.normal(0, 0.001)
                 row = cycle(P, T, ec, et)
                 row.update(
-                    P_setting=P, T_amb=T,
+                    P_setting=P, T_amb=T * 1.8,   # stored in °R
                     mode='normal', degradation=0.0,
                     fault_channel='none', fault_magnitude=0.0,
                 )
@@ -141,7 +142,7 @@ def generate_degradation(n_steps: int = 500) -> list[dict]:
     over n_steps samples at a fixed cruise power setting.
     """
     P      = 0.85     # fixed cruise-like power setting
-    T      = 288.15   # ISA day
+    T      = 288.15   # ISA day  [K]  (used in cycle(); stored as °R below)
     eta_c0 = 0.880
     eta_t0 = 0.900
 
@@ -152,7 +153,7 @@ def generate_degradation(n_steps: int = 500) -> list[dict]:
         eta_t = eta_t0 - 0.020 * frac + RNG.normal(0, 0.001)
         row   = cycle(P, T, eta_c, eta_t)
         row.update(
-            P_setting=P, T_amb=T,
+            P_setting=P, T_amb=T * 1.8,   # stored in °R
             mode='degradation', degradation=frac,
             fault_channel='none', fault_magnitude=0.0,
         )
@@ -171,7 +172,7 @@ def generate_transients(n_per_step: int = 80, tau: float = 0.15) -> list[dict]:
     Smaller tau → faster response.
     """
     steps  = [0.60, 1.00, 0.70, 0.90, 0.65]   # acceleration / deceleration profile
-    T      = 288.15
+    T      = 288.15   # ISA day  [K]  (used in cycle(); stored as °R below)
     eta_c0 = 0.880
     eta_t0 = 0.900
 
@@ -187,7 +188,7 @@ def generate_transients(n_per_step: int = 80, tau: float = 0.15) -> list[dict]:
             et  = eta_t0 + RNG.normal(0, 0.001)
             row = cycle(P, T, ec, et)
             row.update(
-                P_setting=P, T_amb=T,
+                P_setting=P, T_amb=T * 1.8,   # stored in °R
                 mode='transient', degradation=0.0,
                 fault_channel='none', fault_magnitude=0.0,
             )
